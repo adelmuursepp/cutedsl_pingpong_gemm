@@ -217,10 +217,20 @@ class GemmPingPong(GemmSM90):
 
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
+
+            # Kickoff: WG0 self-arrives so its first sync('mma') and sync('epi')
+            # release immediately. WG1 starts blocked on Mma1/Epi1 until WG0
+            # finishes its first phase and arrives on the WG1-side gates.
+            if warp_group_idx == 0:
+                self.pingpong_barrier_arrive(Int32(0), "mma")
+                self.pingpong_barrier_arrive(Int32(0), "epi")
+
+            while work_tile.is_valid_tile:
                 tile_coord_mnk = (
                     work_tile.tile_idx[0],
                     work_tile.tile_idx[1],
                     work_tile.tile_idx[2],
+                )
                 gA_mk = cute.local_tile(
                     mA,
                     cute.select(self.cta_tile_shape_mnk, [0, 2]),
@@ -260,7 +270,6 @@ class GemmPingPong(GemmSM90):
                 tile_scheduler.advance_to_next_work()
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
-                iter_count = iter_count + Int32(1)
 
 
         return
