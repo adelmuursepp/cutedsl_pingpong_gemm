@@ -20,12 +20,13 @@ from cdsl_fn_utils import compile_cutedsl, STREAM
 class PingPongBarrier(IntEnum):
     """Named-barrier IDs.
 
-    Mma{0,1} / Epi{0,1} are 256-thread gates BOTH consumer warpgroups arrive on;
-    they enforce the alternation between WG0 and WG1 across mainloop / epilogue.
-    EpiSync{0,1} are per-warpgroup 128-thread barriers used inside the epilogue
-    to sync between the stmatrix-into-smem step and the TMA-store-out step.
+    Mma{0,1} / Epi{0,1} are 256-thread gates both consumer warpgroups arrive on
+    they enforce the alternation between WG0 and WG1 across mainloop / epilogue
 
-    Barrier id 0 is reserved by hardware for sync_threads(); we start at 1.
+    EpiSync{0,1} are per-warpgroup 128-thread barriers used inside the epilogue
+    to sync between the stmatrix-into-smem step and the TMA-store-out step
+
+    Barrier id 0 is reserved by hardware for sync_threads()
     """
     Mma0 = 1
     Mma1 = 2
@@ -38,17 +39,11 @@ class PingPongBarrier(IntEnum):
 class GemmPingPong(GemmSM90):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # The MMA tile is sized for ONE warpgroup; each consumer WG slices it
-        # independently for its own output tile. atom_layout_mn must be (1,1).
         assert self.atom_layout_mnk == (1, 1, 1), \
             "Gemm ping-pong needs atom_layout_mn=(1, 1)"
-        # Two consumer warpgroups + one producer warpgroup = 384 threads/CTA.
-        # warp_idx 8 issues TMA loads (warps 0..3 = WG0, 4..7 = WG1, 8..11 = producer).
         self.mma_warpgroups = 2
         self.threads_per_cta = (self.mma_warpgroups + 1) * THREADS_PER_WG
         self.ab_load_warp_id = self.mma_warpgroups * 4
-        # Per-stage AB pipeline arrival count is sized for ONE warpgroup (4 warps),
-        # because each warpgroup independently consumes its own subset of stages.
         self.consumer_warps_per_wg = 4
 
     # AB pipeline: per-stage consumer arrives = ONE warpgroup, not both.
@@ -68,11 +63,10 @@ class GemmPingPong(GemmSM90):
             cta_layout_vmnk=cta_layout_vmnk,
         )
 
-    # Ping-pong gates. Each Mma{i}/Epi{i} barrier is a 256-thread gate; both
-    # warpgroups (128 threads each) arrive on it. The ARRIVE is non-blocking,
-    # the SYNC is arrive-and-wait. The kickoff (WG0 self-arrives once on its
-    # own gates) replaces the missing "first arrive from the other side" so
-    # WG0 isn't deadlocked on its first sync.
+    # Ping-pong gates. Each Mma{i}/Epi{i} barrier is a 256-thread gate
+    # both warpgroups (128 threads each) arrive on it 
+    #  The kickoff (WG0 self-arrives once on itsown gates) 
+    # replaces the missing "first arrive from the other side" so WG0 isn't deadlocked on its first sync.
     def pingpong_barrier_arrive(self, target_wg: Int32, stage: str):
         assert stage in ("mma", "epi")
         base_id = int(PingPongBarrier.Mma0) if stage == "mma" else int(PingPongBarrier.Epi0)
@@ -90,8 +84,8 @@ class GemmPingPong(GemmSM90):
         )
 
     # Kernel entry. Producer is unchanged (loads ALL tiles for this CTA in
-    # scheduler order). Consumer block runs the ping-pong: each WG owns
-    # every other tile and alternates mma/epi via the named-barrier gates.
+    # scheduler order). Consumer block runs the ping-pong: 
+    # each WG owns every other tile and alternates mma/epi via the named-barrier gates.
     @cute.kernel
     def kernel(
         self,
@@ -109,10 +103,6 @@ class GemmPingPong(GemmSM90):
         epi_mC: cute.Tensor,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        _bidx, _bidy, _bidz = cute.arch.block_idx()
-        _tidx_full, _, _ = cute.arch.thread_idx()
-        _on_cta0 = (_bidx == 0) and (_bidy == 0) and (_bidz == 0)
-
 
         if warp_idx == self.ab_load_warp_id:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
@@ -157,9 +147,6 @@ class GemmPingPong(GemmSM90):
                         (tile_coord_mnkl[0], None),
                     )
                     k_iters = cute.size(gA_mk, mode=[2])
-                    # if _on_cta0:
-                    #     cute.printf("[PROD   ] tile m=%d n=%d k_iters=%d\n",
-                    #                 tile_coord_mnkl[0], tile_coord_mnkl[1], k_iters)
                     ab_producer_state = self.produce_mainloop(
                         k_iters, ab_pipeline, ab_producer_state,
                         tma_atom_a, tma_atom_b, mA, sA, mB, sB,
@@ -169,8 +156,6 @@ class GemmPingPong(GemmSM90):
                     tile_scheduler.fetch_next_work()
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
-                # if _on_cta0:
-                #     cute.printf("[PROD   ] producer_tail (all tiles loaded)\n")
                 ab_pipeline.producer_tail(ab_producer_state)
 
         # Consumer warpgroups (warps 0..7) 
@@ -202,16 +187,10 @@ class GemmPingPong(GemmSM90):
             # also advance the AB pipeline state by k_iters_first so WG1 starts
             # consuming WG1's first tile, not WG0's.
             #
-            # k_iters_skip < 2 * ab_stage (else 1-bit phase aliases and WG1
-            # reads wrong data). 
+            # k_iters_skip < 2 * ab_stage (else 1-bit phase aliases and WG1 reads wrong data). 
             # The __main__ shape enforces that constraint.
             work_tile = tile_scheduler.initial_work_tile_info()
-            # if _on_cta0 and _tidx_full == 0:
-            #     cute.printf("[WG0    ] initial work_tile: m=%d n=%d\n",
-            #                 work_tile.tile_idx[0], work_tile.tile_idx[1])
-            # if _on_cta0 and _tidx_full == 128:
-            #     cute.printf("[WG1    ] initial work_tile (before skip): m=%d n=%d\n",
-            #                 work_tile.tile_idx[0], work_tile.tile_idx[1])
+
 
             if warp_group_idx == 1:
                 gA_mk_first = cute.local_tile(
@@ -225,25 +204,10 @@ class GemmPingPong(GemmSM90):
 
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
-                # if _on_cta0 and _tidx_full == 128:
-                #     cute.printf("[WG1    ] after skip: state.index=%d state.phase=%d work_tile m=%d n=%d\n",
-                #                 ab_consumer_state.index, ab_consumer_state.phase,
-                #                 work_tile.tile_idx[0], work_tile.tile_idx[1])
-
-            # Kickoff: WG0 self-arrives so its first sync('mma') and sync('epi')
-            # release immediately. WG1 starts blocked on Mma1/Epi1 until WG0
-            # finishes its first phase and arrives on the WG1-side gates.
-            if warp_group_idx == 0:
-                self.pingpong_barrier_arrive(Int32(0), "mma")
-                self.pingpong_barrier_arrive(Int32(0), "epi")
-
-            iter_count = Int32(0)
-            while work_tile.is_valid_tile:
                 tile_coord_mnk = (
                     work_tile.tile_idx[0],
                     work_tile.tile_idx[1],
                     work_tile.tile_idx[2],
-                )
                 gA_mk = cute.local_tile(
                     mA,
                     cute.select(self.cta_tile_shape_mnk, [0, 2]),
@@ -261,14 +225,8 @@ class GemmPingPong(GemmSM90):
                     ab_consumer_state, tCrA, tCrB, tidx, sA, sB,
                 )
 
-                # if _on_cta0 and _tidx_full == 0:
-                #     cute.printf("[WG0 it%d] mma done, acc[0]=%f state.index=%d state.phase=%d\n",
-                #                 iter_count, accumulators[0], ab_consumer_state.index, ab_consumer_state.phase)
-                # if _on_cta0 and _tidx_full == 128:
-                #     cute.printf("[WG1 it%d] mma done, acc[0]=%f state.index=%d state.phase=%d\n",
-                #                 iter_count, accumulators[0], ab_consumer_state.index, ab_consumer_state.phase)
 
-                # Skip the OTHER WG's k_iters worth of stages.
+                # Skip the other WG's k_iters worth of stages.
                 for _ in cutlass.range(k_iters, unroll=1):
                     ab_consumer_state.advance()
 
@@ -278,22 +236,10 @@ class GemmPingPong(GemmSM90):
                 # Wait for permission to enter the epilogue (sD smem).
                 self.pingpong_barrier_sync(warp_group_idx, "epi")
 
-                # if _on_cta0 and _tidx_full == 0:
-                #     cute.printf("[WG0 it%d] entering epilogue tile m=%d n=%d\n",
-                #                 iter_count, tile_coord_mnk[0], tile_coord_mnk[1])
-                # if _on_cta0 and _tidx_full == 128:
-                #     cute.printf("[WG1 it%d] entering epilogue tile m=%d n=%d\n",
-                #                 iter_count, tile_coord_mnk[0], tile_coord_mnk[1])
-
                 self.epilogue_pingpong(
                     tiled_mma, epi_mC, epi_copy, sD, accumulators,
                     tile_coord_mnk, tidx, warp_idx, warp_group_idx,
                 )
-
-                # if _on_cta0 and _tidx_full == 0:
-                #     cute.printf("[WG0 it%d] epilogue done\n", iter_count)
-                # if _on_cta0 and _tidx_full == 128:
-                #     cute.printf("[WG1 it%d] epilogue done\n", iter_count)
 
                 # Hand the epilogue gate to the other WG.
                 self.pingpong_barrier_arrive(Int32(1) - warp_group_idx, "epi")
@@ -307,22 +253,11 @@ class GemmPingPong(GemmSM90):
 
         return
 
-    # Per-WG epilogue. Differences from base.epilogue:
-    # - Inner stmatrix barrier uses a per-WG ID (EpiSync0/EpiSync1) sized for
-    #   128 threads (4 warps), so WG0 and WG1 don't collide on barrier_id=1.
-    # - The TMA-store gate is `warp_idx == warp_group_idx * 4` (warp 0 for
-    #   WG0, warp 4 for WG1) so each WG drives its own TMA store.
-    # - The reuse_ab path is dropped; ping-pong always runs reuse_ab=False.
     @cute.jit
     def epilogue_pingpong(
         self, tiled_mma, epi_mC, epi_copy, sD, accumulators,
         tile_coord_mnk, tidx, warp_idx, warp_group_idx,
     ):
-        # Per-WG inner-epilogue arrive-and-wait barrier. We can't use the
-        # `pipeline.NamedBarrier` wrapper here because its __init__ evaluates
-        # barrier_id at trace time and our id depends on `warp_group_idx`
-        # (runtime Int32). Call `cute.arch.barrier` directly — same primitive
-        # `pingpong_barrier_sync` uses, takes a dynamic barrier_id.
         epi_sync_id = int(PingPongBarrier.EpiSync0) + warp_group_idx
         epi_sync_nthreads = self.consumer_warps_per_wg * cute.arch.WARP_SIZE
 
@@ -352,11 +287,7 @@ class GemmPingPong(GemmSM90):
         epi_tile_shape = tCgC_for_tma_partition.shape[1]
         epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
 
-        # TMA-store pipeline. Match base's pattern: use full threads_per_cta
-        # for the cooperative group. Only the per-WG TMA warp actually calls
-        # producer_commit/acquire/tail, but the pipeline's internal mbarrier
-        # arrival expectations are sized by this group; mismatching it caused
-        # silent corruption in earlier attempts.
+        # TMA-store pipeline 
         c_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, self.threads_per_cta
         )
@@ -365,22 +296,7 @@ class GemmPingPong(GemmSM90):
             producer_group=c_producer_group,
         )
 
-        # WG0's TMA-store warp is warp_idx 0; WG1's is warp_idx 4.
         is_tma_warp = warp_idx == (warp_group_idx * 4)
-
-        # DEBUG gating
-        _bidx_e, _bidy_e, _bidz_e = cute.arch.block_idx()
-        _tidx_e, _, _ = cute.arch.thread_idx()
-        _on_cta0_e = (_bidx_e == 0) and (_bidy_e == 0) and (_bidz_e == 0)
-
-        # if _on_cta0_e and _tidx_e == 0:
-        #     cute.printf("[EPI WG=%d] start: epi_tile_num=%d epi_sync_id=%d tile_coord=(%d,%d)\n",
-        #                 warp_group_idx, epi_tile_num, epi_sync_id,
-        #                 tile_coord_mnk[0], tile_coord_mnk[1])
-        # if _on_cta0_e and _tidx_e == 128:
-        #     cute.printf("[EPI WG=%d] start: epi_tile_num=%d epi_sync_id=%d tile_coord=(%d,%d)\n",
-        #                 warp_group_idx, epi_tile_num, epi_sync_id,
-        #                 tile_coord_mnk[0], tile_coord_mnk[1])
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             for epi_v in cutlass.range_constexpr(size_tRS_rD):
@@ -389,12 +305,6 @@ class GemmPingPong(GemmSM90):
             acc_vec = tRS_rD.load()
             tRS_rD_out.store(acc_vec.to(self.dtype))
 
-            # if _on_cta0_e and _tidx_e == 0:
-            #     cute.printf("[EPI WG=%d] epi_idx=%d acc_to_smem first_val=%f\n",
-            #                 warp_group_idx, Int32(epi_idx), tRS_rD[0])
-            # if _on_cta0_e and _tidx_e == 128:
-            #     cute.printf("[EPI WG=%d] epi_idx=%d acc_to_smem first_val=%f\n",
-            #                 warp_group_idx, Int32(epi_idx), tRS_rD[0])
 
             epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
             cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)])
@@ -406,10 +316,6 @@ class GemmPingPong(GemmSM90):
 
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             if is_tma_warp:
-                # if _on_cta0_e:
-                    # cute.printf("[EPI WG=%d] epi_idx=%d TMA store gmem_coord=(%d,%d) epi_buffer=%d\n",
-                    #             warp_group_idx, Int32(epi_idx),
-                    #             gmem_coord[0], gmem_coord[1], Int32(epi_buffer))
                 cute.copy(epi_copy, bSG_sD[(None, epi_buffer)], bSG_gD[(None, gmem_coord)])
                 c_pipeline.producer_commit()
                 c_pipeline.producer_acquire()
@@ -417,8 +323,6 @@ class GemmPingPong(GemmSM90):
 
         if is_tma_warp:
             c_pipeline.producer_tail()
-            # if _on_cta0_e:
-            #     cute.printf("[EPI WG=%d] producer_tail done\n", warp_group_idx)
 
 
 if __name__ == "__main__":
@@ -432,9 +336,6 @@ if __name__ == "__main__":
     C_ref = (A.float() @ B.float().T).to(torch.bfloat16)
 
     gemm = GemmPingPong(
-        # CRITICAL: with atom_layout_mn=(1, 1), tile_M MUST be 64 (= 1 * 64).
-        # base.populate_mma_atom uses tiler_mn=(64, cta_N // atom_layout[1]) and
-        # atom_layout_mnk=(1,1,1), so total tiled_mma footprint is (1*64, 1*N).
         tile_shape_mn=(64, 256),
         epi_tile_mn=(64, 128),
         cluster_shape_mnk=(2, 1, 1),
