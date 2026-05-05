@@ -17,6 +17,20 @@ from tile_scheduler import SimpleTileScheduler
 from cdsl_fn_utils import compile_cutedsl, STREAM
 
 
+def advance_pipeline_state_n(state, n):
+    """O(1) multi-advance for cutlass.pipeline PipelineState.
+
+    Equivalent to calling state.advance() n times, but computed via divmod on
+    (index + n) so it lowers to a few arithmetic ops instead of an n-iteration
+    runtime loop. Used in WG1 init and the per-tile cross-WG skip.
+    """
+    new_idx = state.index + n
+    wraps = new_idx // state.stages
+    state._count = state._count + n
+    state._index = new_idx % state.stages
+    state._phase = state._phase ^ (wraps & Int32(1))
+
+
 class PingPongBarrier(IntEnum):
     """Named-barrier IDs.
 
@@ -199,8 +213,7 @@ class GemmPingPong(GemmSM90):
                     (work_tile.tile_idx[0], None),
                 )
                 k_iters_skip = cute.size(gA_mk_first, mode=[2])
-                for _ in cutlass.range(k_iters_skip, unroll=1):
-                    ab_consumer_state.advance()
+                advance_pipeline_state_n(ab_consumer_state, k_iters_skip)
 
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
@@ -227,8 +240,7 @@ class GemmPingPong(GemmSM90):
 
 
                 # Skip the other WG's k_iters worth of stages.
-                for _ in cutlass.range(k_iters, unroll=1):
-                    ab_consumer_state.advance()
+                advance_pipeline_state_n(ab_consumer_state, k_iters)
 
                 # Hand the mainloop gate to the other WG so it can start its mma.
                 self.pingpong_barrier_arrive(Int32(1) - warp_group_idx, "mma")
